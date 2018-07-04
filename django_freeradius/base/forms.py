@@ -2,6 +2,7 @@ import re
 
 from django import forms
 from django.core.exceptions import ValidationError
+from django.core.validators import MinValueValidator
 from django.utils.translation import ugettext_lazy as _
 
 from .. import settings as app_settings
@@ -53,3 +54,17 @@ class NasModelForm(forms.ModelForm):
     custom_type = forms.CharField(max_length=nas_type_field.max_length,
                                   required=False,
                                   help_text=_('or define a custom type'))
+
+
+class AbstractRadiusBatchAdminForm(forms.ModelForm):
+    number_of_users = forms.IntegerField(required=False,
+                                         validators=[MinValueValidator(1)],
+                                         help_text=_('Number of users to be generated'))
+
+    def __init__(self, *args, **kwargs):
+        super(AbstractRadiusBatchAdminForm, self).__init__(*args, **kwargs)
+        if self.fields.get('csvfile'):
+            docs_link = "https://django-freeradius.readthedocs.io/en/latest/general/importing_users.html"
+            help_text = "Refer to the <b><u><a href='{}'>docs</a></u></b> for more \
+                details on importing users from a CSV".format(docs_link)
+            self.fields['csvfile'].help_text = help_text
