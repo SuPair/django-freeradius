@@ -1,25 +1,18 @@
+from django.conf import settings
 from django.contrib import admin
+from django.contrib.auth import get_user_model
 
+from . import settings as app_settings
 from .base.admin import (
     AbstractNasAdmin, AbstractRadiusAccountingAdmin, AbstractRadiusBatchAdmin, AbstractRadiusCheckAdmin,
     AbstractRadiusGroupAdmin, AbstractRadiusGroupCheckAdmin, AbstractRadiusGroupReplyAdmin,
-    AbstractRadiusGroupUsersAdmin, AbstractRadiusPostAuthAdmin, AbstractRadiusReplyAdmin,
-    AbstractRadiusUserGroupAdmin,
+    AbstractRadiusPostAuthAdmin, AbstractRadiusReplyAdmin, AbstractRadiusTokenAdmin,
+    AbstractRadiusUserGroupAdmin, AbstractUserAdmin,
 )
 from .models import (
     Nas, RadiusAccounting, RadiusBatch, RadiusCheck, RadiusGroup, RadiusGroupCheck, RadiusGroupReply,
-    RadiusGroupUsers, RadiusPostAuth, RadiusReply, RadiusUserGroup,
+    RadiusPostAuth, RadiusReply, RadiusToken, RadiusUserGroup,
 )
-
-
-@admin.register(RadiusGroup)
-class RadiusGroupAdmin(AbstractRadiusGroupAdmin):
-    pass
-
-
-@admin.register(RadiusGroupUsers)
-class RadiusGroupUsersAdmin(AbstractRadiusGroupUsersAdmin):
-    pass
 
 
 @admin.register(RadiusCheck)
@@ -42,19 +35,27 @@ class NasAdmin(AbstractNasAdmin):
     pass
 
 
-@admin.register(RadiusUserGroup)
-class RadiusUserGroupAdmin(AbstractRadiusUserGroupAdmin):
+@admin.register(RadiusGroup)
+class RadiusGroupAdmin(AbstractRadiusGroupAdmin):
     pass
 
 
-@admin.register(RadiusGroupReply)
-class RadiusGroupReplyAdmin(AbstractRadiusGroupReplyAdmin):
-    pass
+if app_settings.USERGROUP_ADMIN:
+    @admin.register(RadiusUserGroup)
+    class RadiusUserGroupAdmin(AbstractRadiusUserGroupAdmin):
+        pass
 
 
-@admin.register(RadiusGroupCheck)
-class RadiusGroupCheckAdmin(AbstractRadiusGroupCheckAdmin):
-    pass
+if app_settings.GROUPREPLY_ADMIN:
+    @admin.register(RadiusGroupReply)
+    class RadiusGroupReplyAdmin(AbstractRadiusGroupReplyAdmin):
+        pass
+
+
+if app_settings.GROUPCHECK_ADMIN:
+    @admin.register(RadiusGroupCheck)
+    class RadiusGroupCheckAdmin(AbstractRadiusGroupCheckAdmin):
+        pass
 
 
 @admin.register(RadiusPostAuth)
@@ -64,4 +65,18 @@ class RadiusPostAuthAdmin(AbstractRadiusPostAuthAdmin):
 
 @admin.register(RadiusBatch)
 class RadiusBatchAdmin(AbstractRadiusBatchAdmin):
+    pass
+
+
+if settings.DEBUG:
+    @admin.register(RadiusToken)
+    class RadiusTokenAdmin(AbstractRadiusTokenAdmin):
+        pass
+
+user_model = get_user_model()
+admin.site.unregister(user_model)
+
+
+@admin.register(user_model)
+class UserAdmin(AbstractUserAdmin):
     pass

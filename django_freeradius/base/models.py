@@ -1,18 +1,21 @@
 import csv
+import os
+from base64 import encodestring
+from hashlib import md5, sha1
 from io import StringIO
+from os import urandom
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.core.mail import send_mail
 from django.db import models
-from django.db.models import Count
+from django.db.models import Count, ProtectedError
 from django.utils.crypto import get_random_string
-from django.utils.encoding import python_2_unicode_compatible
 from django.utils.timezone import now
 from django.utils.translation import ugettext_lazy as _
 from openwisp_utils.base import TimeStampedEditableModel
-from passlib.hash import lmhash, nthash
+from passlib.hash import lmhash, nthash, sha512_crypt
 
 from django_freeradius.settings import (
     BATCH_DEFAULT_PASSWORD_LENGTH, BATCH_MAIL_MESSAGE, BATCH_MAIL_SENDER, BATCH_MAIL_SUBJECT,
@@ -22,6 +25,8 @@ from django_freeradius.utils import (
 )
 
 from .. import settings as app_settings
+
+User = get_user_model()
 
 RADOP_CHECK_TYPES = (('=', '='),
                      (':=', ':='),
@@ -37,7 +42,7 @@ RADOP_CHECK_TYPES = (('=', '='),
                      ('=*', '=*'),
                      ('!*', '!*'))
 
-RAD_NAS_TYPES = (
+RAD_NAS_TYPES = app_settings.EXTRA_NAS_TYPES + (
     ('Async', 'Async'),
     ('Sync', 'Sync'),
     ('ISDN Sync', 'ISDN Sync'),
@@ -91,13 +96,20 @@ RADOP_REPLY_TYPES = (('=', '='),
                      (':=', ':='),
                      ('+=', '+='))
 
+RADCHECK_ATTRIBUTE_TYPES = ['Max-Daily-Session',
+                            'Max-All-Session',
+                            'Max-Daily-Session-Traffic']
+
 RADCHECK_PASSWD_TYPE = ['Cleartext-Password',
                         'NT-Password',
                         'LM-Password',
                         'MD5-Password',
                         'SMD5-Password',
+                        'SHA-Password',
                         'SSHA-Password',
                         'Crypt-Password']
+
+RADCHECK_ATTRIBUTE_TYPES += RADCHECK_PASSWD_TYPE
 
 STRATEGIES = (
     ('prefix', _('Generate from prefix')),
@@ -112,78 +124,36 @@ class BaseModel(TimeStampedEditableModel):
         abstract = True
 
 
-@python_2_unicode_compatible
-class AbstractRadiusGroup(BaseModel):
-    id = models.UUIDField(primary_key=True, db_column='id')
-    groupname = models.CharField(verbose_name=_('group name'),
-                                 max_length=255,
-                                 unique=True,
-                                 db_index=True)
-    priority = models.IntegerField(verbose_name=_('priority'), default=1)
-    notes = models.CharField(verbose_name=_('notes'),
-                             max_length=64,
-                             blank=True,
-                             null=True)
-
-    class Meta:
-        db_table = 'radiusgroup'
-        verbose_name = _('radius group')
-        verbose_name_plural = _('radius groups')
-        abstract = True
-
-    def __str__(self):
-        return self.groupname
+_NOT_BLANK_MESSAGE = _('This field cannot be blank.')
 
 
-@python_2_unicode_compatible
-class AbstractRadiusGroupUsers(BaseModel):
-    id = models.UUIDField(primary_key=True,
-                          db_column='id')
-    username = models.CharField(verbose_name=_('username'),
-                                max_length=64,
-                                unique=True)
-    groupname = models.CharField(verbose_name=_('group name'),
-                                 max_length=255,
-                                 unique=True)
-    radius_reply = models.ManyToManyField('RadiusReply',
-                                          verbose_name=_('radius reply'),
-                                          blank=True,
-                                          db_column='radiusreply')
-    radius_check = models.ManyToManyField('RadiusCheck',
-                                          verbose_name=_('radius check'),
-                                          blank=True,
-                                          db_column='radiuscheck')
-
-    class Meta:
-        db_table = 'radiusgroupusers'
-        verbose_name = _('radius group users')
-        verbose_name_plural = _('radius group users')
-        abstract = True
-
-    def __str__(self):
-        return self.username
+class AutoUsernameMixin(object):
+    def clean(self):
+        """
+        automatically sets username
+        """
+        if self.user:
+            self.username = self.user.username
+        elif not self.username:
+            raise ValidationError({
+                'username': _NOT_BLANK_MESSAGE,
+                'user': _NOT_BLANK_MESSAGE
+            })
 
 
-@python_2_unicode_compatible
-class AbstractRadiusReply(BaseModel):
-    username = models.CharField(verbose_name=_('username'),
-                                max_length=64,
-                                db_index=True)
-    value = models.CharField(verbose_name=_('value'), max_length=253)
-    op = models.CharField(verbose_name=_('operator'),
-                          max_length=2,
-                          choices=RADOP_REPLY_TYPES,
-                          default='=')
-    attribute = models.CharField(verbose_name=_('attribute'), max_length=64)
-
-    class Meta:
-        db_table = 'radreply'
-        verbose_name = _('radius reply')
-        verbose_name_plural = _('radius replies')
-        abstract = True
-
-    def __str__(self):
-        return self.username
+class AutoGroupnameMixin(object):
+    def clean(self):
+        """
+        automatically sets groupname
+        """
+        super().clean()
+        if self.group:
+            self.groupname = self.group.name
+        elif not self.groupname:
+            raise ValidationError({
+                'groupname': _NOT_BLANK_MESSAGE,
+                'group': _NOT_BLANK_MESSAGE
+            })
 
 
 class AbstractRadiusCheckQueryset(models.query.QuerySet):
@@ -207,13 +177,31 @@ class AbstractRadiusCheckQueryset(models.query.QuerySet):
 
 
 def _encode_secret(attribute, new_value=None):
-    if attribute == 'Cleartext-Password':
-        password_renewed = new_value
-    elif attribute == 'NT-Password':
-        password_renewed = nthash.hash(new_value)
+    if attribute == 'NT-Password':
+        attribute_value = nthash.hash(new_value)
     elif attribute == 'LM-Password':
-        password_renewed = lmhash.hash(new_value)
-    return password_renewed
+        attribute_value = lmhash.hash(new_value)
+    elif attribute == 'MD5-Password':
+        attribute_value = md5(new_value.encode('utf-8')).hexdigest()
+    elif attribute == 'SMD5-Password':
+        salt = urandom(4)
+        hash = md5(new_value.encode('utf-8'))
+        hash.update(salt)
+        hash_encoded = encodestring(hash.digest() + salt)
+        attribute_value = hash_encoded.decode('utf-8')[:-1]
+    elif attribute == 'SHA-Password':
+        attribute_value = sha1(new_value.encode('utf-8')).hexdigest()
+    elif attribute == 'SSHA-Password':
+        salt = urandom(4)
+        hash = sha1(new_value.encode('utf-8'))
+        hash.update(salt)
+        hash_encoded = encodestring(hash.digest() + salt)
+        attribute_value = hash_encoded.decode('utf-8')[:-1]
+    elif attribute == 'Crypt-Password':
+        attribute_value = sha512_crypt.hash(new_value)
+    else:
+        attribute_value = new_value
+    return attribute_value
 
 
 class AbstractRadiusCheckManager(models.Manager):
@@ -228,11 +216,14 @@ class AbstractRadiusCheckManager(models.Manager):
         return super(AbstractRadiusCheckManager, self).create(*args, **kwargs)
 
 
-@python_2_unicode_compatible
-class AbstractRadiusCheck(BaseModel):
+class AbstractRadiusCheck(AutoUsernameMixin, BaseModel):
     username = models.CharField(verbose_name=_('username'),
                                 max_length=64,
-                                db_index=True)
+                                db_index=True,
+                                # blank values are forbidden with custom validation
+                                # because this field can left blank if the user
+                                # foreign key is filled (it will be auto-filled)
+                                blank=True)
     value = models.CharField(verbose_name=_('value'), max_length=253)
     op = models.CharField(verbose_name=_('operator'),
                           max_length=2,
@@ -240,11 +231,15 @@ class AbstractRadiusCheck(BaseModel):
                           default=':=')
     attribute = models.CharField(verbose_name=_('attribute'),
                                  max_length=64,
-                                 choices=[(i, i) for i in RADCHECK_PASSWD_TYPE
+                                 choices=[(i, i) for i in RADCHECK_ATTRIBUTE_TYPES
                                           if i not in
                                           app_settings.DISABLED_SECRET_FORMATS],
-                                 blank=True,
                                  default=app_settings.DEFAULT_SECRET_FORMAT)
+    # the foreign key is not part of the standard freeradius schema
+    user = models.ForeignKey(settings.AUTH_USER_MODEL,
+                             on_delete=models.CASCADE,
+                             blank=True,
+                             null=True)
     # additional fields to enable more granular checks
     is_active = models.BooleanField(default=True)
     valid_until = models.DateTimeField(null=True, blank=True)
@@ -255,15 +250,44 @@ class AbstractRadiusCheck(BaseModel):
 
     class Meta:
         db_table = 'radcheck'
-        verbose_name = _('radius check')
-        verbose_name_plural = _('radius checks')
+        verbose_name = _('check')
+        verbose_name_plural = _('checks')
         abstract = True
 
     def __str__(self):
         return self.username
 
 
-@python_2_unicode_compatible
+class AbstractRadiusReply(AutoUsernameMixin, BaseModel):
+    username = models.CharField(verbose_name=_('username'),
+                                max_length=64,
+                                db_index=True,
+                                # blank values are forbidden with custom validation
+                                # because this field can left blank if the user
+                                # foreign key is filled (it will be auto-filled)
+                                blank=True)
+    value = models.CharField(verbose_name=_('value'), max_length=253)
+    op = models.CharField(verbose_name=_('operator'),
+                          max_length=2,
+                          choices=RADOP_REPLY_TYPES,
+                          default='=')
+    attribute = models.CharField(verbose_name=_('attribute'), max_length=64)
+    # the foreign key is not part of the standard freeradius schema
+    user = models.ForeignKey(settings.AUTH_USER_MODEL,
+                             on_delete=models.CASCADE,
+                             blank=True,
+                             null=True)
+
+    class Meta:
+        db_table = 'radreply'
+        verbose_name = _('reply')
+        verbose_name_plural = _('replies')
+        abstract = True
+
+    def __str__(self):
+        return self.username
+
+
 class AbstractRadiusAccounting(models.Model):
     id = models.BigAutoField(primary_key=True, db_column='radacctid')
     session_id = models.CharField(verbose_name=_('session ID'),
@@ -348,11 +372,13 @@ class AbstractRadiusAccounting(models.Model):
     called_station_id = models.CharField(verbose_name=_('called station ID'),
                                          max_length=50,
                                          db_column='calledstationid',
+                                         db_index=True,
                                          blank=True,
                                          null=True)
     calling_station_id = models.CharField(verbose_name=_('calling station ID'),
                                           max_length=50,
                                           db_column='callingstationid',
+                                          db_index=True,
                                           blank=True,
                                           null=True)
     terminate_cause = models.CharField(verbose_name=_('termination cause'),
@@ -394,7 +420,6 @@ class AbstractRadiusAccounting(models.Model):
         return self.unique_id
 
 
-@python_2_unicode_compatible
 class AbstractNas(BaseModel):
     name = models.CharField(verbose_name=_('name'),
                             max_length=128,
@@ -406,7 +431,8 @@ class AbstractNas(BaseModel):
                                   db_column='shortname')
     type = models.CharField(verbose_name=_('type'),
                             max_length=30,
-                            default='other')
+                            default='other',
+                            choices=RAD_NAS_TYPES)
     ports = models.PositiveIntegerField(verbose_name=_('ports'),
                                         blank=True,
                                         null=True)
@@ -436,70 +462,193 @@ class AbstractNas(BaseModel):
         return self.name
 
 
-@python_2_unicode_compatible
-class AbstractRadiusUserGroup(BaseModel):
+class AbstractRadiusGroup(BaseModel):
+    """
+    This is not part of the standard freeradius schema.
+    It's added to facilitate the management of groups.
+    """
+    id = TimeStampedEditableModel._meta.get_field('id')
+    name = models.CharField(verbose_name=_('group name'),
+                            max_length=255,
+                            unique=True,
+                            db_index=True)
+    description = models.CharField(verbose_name=_('description'),
+                                   max_length=64,
+                                   blank=True,
+                                   null=True)
+    _DEFAULT_HELP_TEXT = (
+        'The default group is automatically assigned to new users; '
+        'changing the default group has only effect on new users '
+        '(existing users will keep being members of their current group)'
+    )
+    default = models.BooleanField(verbose_name=_('is default?'),
+                                  help_text=_(_DEFAULT_HELP_TEXT),
+                                  default=False)
+
+    class Meta:
+        verbose_name = _('group')
+        verbose_name_plural = _('groups')
+        abstract = True
+
+    def __str__(self):
+        return self.name
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._initial_default = self.default
+
+    def clean(self):
+        self.check_default()
+
+    def save(self, *args, **kwargs):
+        result = super().save(*args, **kwargs)
+        if self.default:
+            self.set_default()
+        # sync all related records
+        if not self._state.adding:
+            self.radiusgroupcheck_set.update(groupname=self.name)
+            self.radiusgroupreply_set.update(groupname=self.name)
+            self.radiususergroup_set.update(groupname=self.name)
+        return result
+
+    _DEFAULT_VALIDATION_ERROR = _(
+        'There must be at least one default group present in '
+        'the system. To change the default group, simply set '
+        'as deafult the group you want to make the new deafult.'
+    )
+    _DEFAULT_PROTECTED_ERROR = _('The default group cannot be deleted')
+
+    def delete(self, *args, **kwargs):
+        if self.default:
+            raise ProtectedError(self._DEFAULT_PROTECTED_ERROR, self)
+        return super().delete(*args, **kwargs)
+
+    def set_default(self):
+        """
+        ensures there's only 1 default group
+        (logic overridable via custom models)
+        """
+        queryset = self.get_default_queryset()
+        if queryset.exists():
+            queryset.update(default=False)
+
+    def check_default(self):
+        """
+        ensures the default group cannot be undefaulted
+        (logic overridable via custom models)
+        """
+        if not self.default and self._initial_default:
+            raise ValidationError(
+                {'default': self._DEFAULT_VALIDATION_ERROR}
+            )
+
+    def get_default_queryset(self):
+        """
+        looks for default groups excluding the current one
+        overridable by openwisp-radius and other 3rd party apps
+        """
+        return self.__class__.objects.exclude(pk=self.pk) \
+                                     .filter(default=True)
+
+
+class AbstractRadiusUserGroup(AutoGroupnameMixin, AutoUsernameMixin,
+                              BaseModel):
     username = models.CharField(verbose_name=_('username'),
                                 max_length=64,
-                                db_index=True)
+                                db_index=True,
+                                # blank values are forbidden with custom validation
+                                # because this field can left blank if the user
+                                # foreign key is filled (it will be auto-filled)
+                                blank=True)
     groupname = models.CharField(verbose_name=_('group name'),
-                                 max_length=64)
+                                 max_length=64,
+                                 # blank values are forbidden with custom validation
+                                 # because this field can left blank if the group
+                                 # foreign key is filled (it will be auto-filled)
+                                 blank=True)
     priority = models.IntegerField(verbose_name=_('priority'), default=1)
+    # the foreign keys are not part of the standard freeradius schema,
+    # these are added here to facilitate the synchronization of the
+    # records which are related in different tables
+    user = models.ForeignKey(settings.AUTH_USER_MODEL,
+                             on_delete=models.CASCADE,
+                             blank=True,
+                             null=True)
+    group = models.ForeignKey('RadiusGroup',
+                              on_delete=models.CASCADE,
+                              blank=True,
+                              null=True)
 
     class Meta:
         db_table = 'radusergroup'
-        verbose_name = _('radius user group association')
-        verbose_name_plural = _('radius user group associations')
+        verbose_name = _('user group')
+        verbose_name_plural = _('user groups')
         abstract = True
 
     def __str__(self):
         return str(self.username)
 
 
-@python_2_unicode_compatible
-class AbstractRadiusGroupReply(BaseModel):
+class AbstractRadiusGroupCheck(AutoGroupnameMixin, BaseModel):
     groupname = models.CharField(verbose_name=_('group name'),
                                  max_length=64,
-                                 db_index=True)
-    attribute = models.CharField(verbose_name=_('attribute'), max_length=64)
-    op = models.CharField(verbose_name=_('operator'),
-                          max_length=2,
-                          choices=RADOP_REPLY_TYPES,
-                          default='=')
-    value = models.CharField(verbose_name=_('value'), max_length=253)
-
-    class Meta:
-        db_table = 'radgroupreply'
-        verbose_name = _('radius group reply')
-        verbose_name_plural = _('radius group replies')
-        abstract = True
-
-    def __str__(self):
-        return str(self.groupname)
-
-
-@python_2_unicode_compatible
-class AbstractRadiusGroupCheck(BaseModel):
-    groupname = models.CharField(verbose_name=_('group name'),
-                                 max_length=64,
-                                 db_index=True)
+                                 db_index=True,
+                                 # blank values are forbidden with custom validation
+                                 # because this field can left blank if the group
+                                 # foreign key is filled (it will be auto-filled)
+                                 blank=True)
     attribute = models.CharField(verbose_name=_('attribute'), max_length=64)
     op = models.CharField(verbose_name=_('operator'),
                           max_length=2,
                           choices=RADOP_CHECK_TYPES,
                           default=':=')
     value = models.CharField(verbose_name=_('value'), max_length=253)
+    # the foreign key is not part of the standard freeradius schema
+    group = models.ForeignKey('RadiusGroup',
+                              on_delete=models.CASCADE,
+                              blank=True,
+                              null=True)
 
     class Meta:
         db_table = 'radgroupcheck'
-        verbose_name = _('radius group check')
-        verbose_name_plural = _('radius group checks')
+        verbose_name = _('group check')
+        verbose_name_plural = _('group checks')
         abstract = True
 
     def __str__(self):
         return str(self.groupname)
 
 
-@python_2_unicode_compatible
+class AbstractRadiusGroupReply(AutoGroupnameMixin, BaseModel):
+    groupname = models.CharField(verbose_name=_('group name'),
+                                 max_length=64,
+                                 db_index=True,
+                                 # blank values are forbidden with custom validation
+                                 # because this field can left blank if the group
+                                 # foreign key is filled (it will be auto-filled)
+                                 blank=True)
+    attribute = models.CharField(verbose_name=_('attribute'), max_length=64)
+    op = models.CharField(verbose_name=_('operator'),
+                          max_length=2,
+                          choices=RADOP_REPLY_TYPES,
+                          default='=')
+    value = models.CharField(verbose_name=_('value'), max_length=253)
+    # the foreign key is not part of the standard freeradius schema
+    group = models.ForeignKey('RadiusGroup',
+                              on_delete=models.CASCADE,
+                              blank=True,
+                              null=True)
+
+    class Meta:
+        db_table = 'radgroupreply'
+        verbose_name = _('group reply')
+        verbose_name_plural = _('group replies')
+        abstract = True
+
+    def __str__(self):
+        return str(self.groupname)
+
+
 class AbstractRadiusPostAuth(models.Model):
     username = models.CharField(verbose_name=_('username'),
                                 max_length=64)
@@ -525,8 +674,8 @@ class AbstractRadiusPostAuth(models.Model):
 
     class Meta:
         db_table = 'radpostauth'
-        verbose_name = _('radius post authentication log')
-        verbose_name_plural = _('radius post authentication logs')
+        verbose_name = _('post auth')
+        verbose_name_plural = _('post auth log')
         abstract = True
 
     def __str__(self):
@@ -534,15 +683,16 @@ class AbstractRadiusPostAuth(models.Model):
 
 
 class AbstractRadiusBatch(TimeStampedEditableModel):
-    name = models.CharField(verbose_name=_('name'),
-                            max_length=128,
-                            help_text=_('A unique batch name'),
-                            db_index=True)
     strategy = models.CharField(_('strategy'),
                                 max_length=16,
                                 choices=STRATEGIES,
                                 db_index=True,
                                 help_text=_('Import users from a CSV or generate using a prefix'))
+    name = models.CharField(verbose_name=_('name'),
+                            max_length=128,
+                            help_text=_('A unique batch name'),
+                            db_index=True,
+                            unique=True)
     users = models.ManyToManyField(settings.AUTH_USER_MODEL,
                                    blank=True,
                                    related_name='radius_batch',
@@ -567,54 +717,41 @@ class AbstractRadiusBatch(TimeStampedEditableModel):
 
     class Meta:
         db_table = 'radbatch'
-        verbose_name = _('Batch user creation')
-        verbose_name_plural = _('Batch user creation operations')
+        verbose_name = _('batch user creation')
+        verbose_name_plural = _('batch user creation operations')
         abstract = True
 
     def __str__(self):
         return self.name
 
     def clean(self):
-        if self.csvfile and self.prefix or not self.csvfile and not self.prefix:
-            raise ValidationError(
-                _('Only one of the fields csvfile/prefix needs to be non empty'),
-                code='invalid',
-            )
+        if self.strategy == 'csv' and not self.csvfile:
+            raise ValidationError({'csvfile': _('This field cannot be blank.')},
+                                  code='invalid')
+        if self.strategy == 'prefix' and not self.prefix:
+            raise ValidationError({'prefix': _('This field cannot be blank.')},
+                                  code='invalid')
         if self.strategy == 'csv' and self.prefix or self.strategy == 'prefix' and self.csvfile:
+            # this case would happen only when using the internal API
             raise ValidationError(
-                _('Check your strategy and the respective values provided'),
+                _('Mixing fields of different strategies'),
                 code='invalid',
             )
-        if self.strategy == 'csv' and self.csvfile:
+        if self.strategy == 'csv':
             validate_csvfile(self.csvfile.file)
         super(AbstractRadiusBatch, self).clean()
 
     def add(self, reader, password_length=BATCH_DEFAULT_PASSWORD_LENGTH):
-        User = get_user_model()
         users_list = []
         generated_passwords = []
         for row in reader:
             if len(row) == 5:
-                username, password, email, first_name, last_name = row
-                if not username and email:
-                    username = email.split('@')[0]
-                username = find_available_username(username, users_list)
-                user = User(username=username, email=email, first_name=first_name, last_name=last_name)
-                cleartext_delimiter = 'cleartext$'
-                if not password:
-                    password = get_random_string(length=password_length)
-                    user.set_password(password)
-                    generated_passwords.append([username, password, email])
-                elif password and password.startswith(cleartext_delimiter):
-                    password = password[len(cleartext_delimiter):]
-                    user.set_password(password)
-                else:
-                    user.password = password
-                user.full_clean()
+                user, password = self.get_or_create_user(row, users_list, password_length)
                 users_list.append(user)
-        for u in users_list:
-            u.save()
-            self.users.add(u)
+                if password:
+                    generated_passwords.append(password)
+        for user in users_list:
+            self.save_user(user)
         for element in generated_passwords:
             username, password, user_email = element
             send_mail(
@@ -626,7 +763,7 @@ class AbstractRadiusBatch(TimeStampedEditableModel):
 
     def csvfile_upload(self, csvfile, password_length=BATCH_DEFAULT_PASSWORD_LENGTH):
         csv_data = csvfile.read()
-        csv_data = csv_data.decode("utf-8") if isinstance(csv_data, bytes) else csv_data
+        csv_data = csv_data.decode('utf-8') if isinstance(csv_data, bytes) else csv_data
         reader = csv.reader(StringIO(csv_data), delimiter=',')
         self.full_clean()
         self.save()
@@ -635,20 +772,86 @@ class AbstractRadiusBatch(TimeStampedEditableModel):
     def prefix_add(self, prefix, n, password_length=BATCH_DEFAULT_PASSWORD_LENGTH):
         self.save()
         users_list, user_password = prefix_generate_users(prefix, n, password_length)
-        for u in users_list:
-            u.save()
-            self.users.add(u)
-        f = generate_pdf(prefix, {'users': user_password})
-        self.pdf = f
+        for user in users_list:
+            user.full_clean()
+            self.save_user(user)
+        pdf_file = generate_pdf(prefix, {'users': user_password})
+        pdf_file.name = pdf_file.name.split('/')[-1]
+        self.pdf = pdf_file
         self.full_clean()
         self.save()
 
+    def get_or_create_user(self, row, users_list, password_length):
+        generated_password = None
+        username, password, email, first_name, last_name = row
+        if not username and email:
+            username = email.split('@')[0]
+        username = find_available_username(username, users_list)
+        user = User(username=username,
+                    email=email,
+                    first_name=first_name,
+                    last_name=last_name)
+        cleartext_delimiter = 'cleartext$'
+        if not password:
+            password = get_random_string(length=password_length)
+            user.set_password(password)
+            generated_password = ([username, password, email])
+        elif password and password.startswith(cleartext_delimiter):
+            password = password[len(cleartext_delimiter):]
+            user.set_password(password)
+        else:
+            user.password = password
+        user.full_clean()
+        return user, generated_password
+
+    def save_user(self, user):
+        user.save()
+        self.users.add(user)
+
     def delete(self):
         self.users.all().delete()
-        super(AbstractRadiusBatch, self).delete()
+        super().delete()
+        self._remove_files()
 
     def expire(self):
         users = self.users.all()
         for u in users:
             u.is_active = False
             u.save()
+
+    def _remove_files(self):
+        strategy_filemap = {
+            'prefix': 'pdf',
+            'csv': 'csvfile'
+        }
+        path = getattr(self, strategy_filemap.get(self.strategy)).path
+        if os.path.isfile(path):
+            os.remove(path)
+
+
+class AbstractRadiusToken(TimeStampedEditableModel, models.Model):
+    # key field is a primary key so additional id field will be redundant
+    id = None
+    # tokens are not supposed to be modified, can be regenerated if necessary
+    modified = None
+    key = models.CharField(_('Key'), max_length=40, primary_key=True)
+    user = models.OneToOneField(settings.AUTH_USER_MODEL,
+                                on_delete=models.CASCADE,
+                                related_name='radius_token')
+
+    class Meta:
+        db_table = 'radiustoken'
+        verbose_name = _('radius token')
+        verbose_name_plural = _('radius token')
+        abstract = True
+
+    def save(self, *args, **kwargs):
+        if not self.key:
+            self.key = self.generate_key()
+        return super().save(*args, **kwargs)
+
+    def generate_key(self):
+        return get_random_string(length=40)
+
+    def __str__(self):
+        return self.key

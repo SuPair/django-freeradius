@@ -1,6 +1,8 @@
 import csv
 from io import StringIO
 
+import swapper
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.core.files import File
@@ -62,7 +64,27 @@ def prefix_generate_users(prefix, n, password_length):
 def generate_pdf(prefix, data):
     template = get_template(BATCH_PDF_TEMPLATE)
     html = template.render(data)
-    f = open('{}.pdf'.format(prefix), 'w+b')
+    f = open('{}/{}.pdf'.format(settings.MEDIA_ROOT, prefix), 'w+b')
     pisa.CreatePDF(html.encode('utf-8'), dest=f, encoding='utf-8')
     f.seek(0)
     return File(f)
+
+
+def set_default_group(sender, instance, created, **kwargs):
+    if created:
+        RadiusGroup = swapper.load_model('django_freeradius', 'RadiusGroup')
+        RadiusUserGroup = swapper.load_model('django_freeradius', 'RadiusUserGroup')
+        queryset = RadiusGroup.objects.filter(default=True)
+        if queryset.exists():
+            ug = RadiusUserGroup(user=instance,
+                                 group=queryset.first())
+            ug.full_clean()
+            ug.save()
+
+
+def update_user_related_records(sender, instance, created, **kwargs):
+    if created:
+        return
+    instance.radiususergroup_set.update(username=instance.username)
+    instance.radiuscheck_set.update(username=instance.username)
+    instance.radiusreply_set.update(username=instance.username)
